@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import { motion } from 'framer-motion';
+import { useIntegrationStatus } from './hooks/useIntegrationStatus';
 import ReorderList from './ReorderList';
 import { Button } from './ui/button';
 import {
@@ -17,7 +18,7 @@ import {
 import { Collapsible, CollapsibleTrigger, CollapsibleContent } from './ui/collapsible';
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from './ui/tooltip';
 import { Popover, PopoverContent, PopoverTrigger } from './ui/popover';
-import { Home, ChevronRight, Plus, FolderOpen, Github, Archive, RotateCcw } from 'lucide-react';
+import { Home, ChevronRight, Plus, FolderOpen, Github, Archive, RotateCcw, Download } from 'lucide-react';
 import SidebarEmptyState from './SidebarEmptyState';
 import { TaskItem } from './TaskItem';
 import ProjectDeleteButton from './ProjectDeleteButton';
@@ -44,6 +45,7 @@ interface LeftSidebarProps {
     setOpen: (next: boolean) => void;
   }) => void;
   onCreateTaskForProject?: (project: Project) => void;
+  onBulkImportJira?: (project: Project) => void;
   onDeleteTask?: (project: Project, task: Task) => void | Promise<void | boolean>;
   onRenameTask?: (project: Project, task: Task, newName: string) => void | Promise<void>;
   onArchiveTask?: (project: Project, task: Task) => void | Promise<void | boolean>;
@@ -106,6 +108,7 @@ const LeftSidebar: React.FC<LeftSidebarProps> = ({
   onReorderProjectsFull,
   onSidebarContextChange,
   onCreateTaskForProject,
+  onBulkImportJira,
   onDeleteTask,
   onRenameTask,
   onArchiveTask,
@@ -116,6 +119,7 @@ const LeftSidebar: React.FC<LeftSidebarProps> = ({
   const { open, isMobile, setOpen } = useSidebar();
   const [deletingProjectId, setDeletingProjectId] = useState<string | null>(null);
   const [archivedTasksByProject, setArchivedTasksByProject] = useState<Record<string, Task[]>>({});
+  const { isJiraConnected } = useIntegrationStatus(true);
 
   // Fetch archived tasks for all projects
   const fetchArchivedTasks = useCallback(async () => {
@@ -331,6 +335,30 @@ const LeftSidebar: React.FC<LeftSidebarProps> = ({
                                 />
                                 <span className="truncate">New Task</span>
                               </motion.button>
+                              {isJiraConnected && onBulkImportJira && (
+                                <motion.button
+                                  type="button"
+                                  whileTap={{ scale: 0.97 }}
+                                  transition={{ duration: 0.1, ease: 'easeInOut' }}
+                                  className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-sm text-muted-foreground transition-colors hover:bg-black/5 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50 dark:hover:bg-white/5"
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    if (onSelectProject && selectedProject?.id !== typedProject.id) {
+                                      onSelectProject(typedProject);
+                                    } else if (!selectedProject) {
+                                      onSelectProject?.(typedProject);
+                                    }
+                                    onBulkImportJira(typedProject);
+                                  }}
+                                  aria-label={`Bulk Import from Jira for ${typedProject.name}`}
+                                >
+                                  <Download
+                                    className="h-3 w-3 flex-shrink-0 text-muted-foreground"
+                                    aria-hidden
+                                  />
+                                  <span className="truncate">Bulk Import</span>
+                                </motion.button>
+                              )}
                               <div className="hidden min-w-0 space-y-0.5 sm:block">
                                 {typedProject.tasks?.map((task) => {
                                   const isActive = activeTask?.id === task.id;

@@ -106,43 +106,112 @@ export default class JiraService {
     }
   }
 
-  async initialFetch(limit = 50): Promise<any[]> {
+  async initialFetch(
+    limit = 50,
+    options?: { hideResolved?: boolean; projectKey?: string; nextPageToken?: string }
+  ): Promise<{ issues: any[]; total: number; startAt: number; maxResults: number; nextPageToken?: string }> {
     const { siteUrl, email, token } = await this.requireAuth();
+    const nextPageToken = options?.nextPageToken;
+
+    // Build filter clauses
+    const filters: string[] = [];
+    if (options?.hideResolved) {
+      filters.push('status NOT IN (Done, Resolved, Closed)');
+    }
+    if (options?.projectKey) {
+      filters.push(`project = "${options.projectKey}"`);
+    }
+
+    // Helper to build full JQL with filters
+    const buildJql = (baseQuery: string) => {
+      const filterStr = filters.join(' AND ');
+      if (!baseQuery) {
+        return `${filterStr} ORDER BY updated DESC`;
+      }
+      if (!filterStr) {
+        return `${baseQuery} ORDER BY updated DESC`;
+      }
+      return `${filterStr} AND ${baseQuery} ORDER BY updated DESC`;
+    };
+
     const jqlCandidates: string[] = [];
-    // Pragmatic fallbacks that typically work with limited permissions
-    jqlCandidates.push(
-      'assignee = currentUser() ORDER BY updated DESC',
-      'reporter = currentUser() ORDER BY updated DESC',
-      'ORDER BY updated DESC'
-    );
+    // Try broadest query first to show all accessible issues (not just assigned)
+    if (filters.length === 0) {
+      // No filters, use simpler queries
+      jqlCandidates.push(
+        'ORDER BY updated DESC',
+        '(assignee = currentUser() OR assignee is EMPTY) ORDER BY updated DESC',
+        'assignee = currentUser() ORDER BY updated DESC'
+      );
+    } else {
+      // With filters, need parentheses for correct precedence
+      jqlCandidates.push(
+        buildJql(''), // Just filters
+        buildJql('(assignee = currentUser() OR assignee is EMPTY)'),
+        buildJql('assignee = currentUser()')
+      );
+    }
+
+    console.log('[JiraService] initialFetch filters:', { hideResolved: options?.hideResolved, projectKey: options?.projectKey });
+    console.log('[JiraService] JQL candidates:', jqlCandidates);
 
     for (const jql of jqlCandidates) {
       try {
-        const issues = await this.searchRaw(siteUrl, email, token, jql, limit);
-        if (issues.length > 0) return this.normalizeIssues(siteUrl, issues);
-      } catch {
+        console.log('[JiraService] Trying JQL:', jql);
+        const result = await this.searchRaw(siteUrl, email, token, jql, limit, nextPageToken);
+        console.log('[JiraService] Result:', { issuesCount: result.issues.length, total: result.total });
+        if (result.issues.length > 0) {
+          return {
+            issues: this.normalizeIssues(siteUrl, result.issues),
+            total: result.total,
+            startAt: result.startAt,
+            maxResults: result.maxResults,
+            nextPageToken: result.nextPageToken,
+          };
+        }
+      } catch (err) {
+        console.log('[JiraService] JQL failed:', jql, err);
         // Try next candidate if this one is forbidden or failed
       }
     }
+
+    // Don't use issue picker fallback when filters are active
+    // (issue picker doesn't support filters, so results would be misleading)
+    if (options?.hideResolved || options?.projectKey) {
+      console.log('[JiraService] No results found with filters, returning empty');
+      return { issues: [], total: 0, startAt: 0, maxResults: limit, nextPageToken: undefined };
+    }
+
     // Final fallback: use issue picker to get recent/history issues, then hydrate via GET /issue/{key}
-    try {
-      const keys = await this.getRecentIssueKeys(siteUrl, email, token, limit);
-      if (keys.length > 0) {
-        const results: any[] = [];
-        for (const key of keys.slice(0, limit)) {
-          try {
-            const issue = await this.getIssueByKey(siteUrl, email, token, key);
-            if (issue) results.push(issue);
-          } catch {
-            // skip individual failures
+    // Note: Only use this fallback on initial fetch (no pagination token)
+    if (!nextPageToken) {
+      try {
+        const keys = await this.getRecentIssueKeys(siteUrl, email, token, limit);
+        if (keys.length > 0) {
+          const results: any[] = [];
+          for (const key of keys.slice(0, limit)) {
+            try {
+              const issue = await this.getIssueByKey(siteUrl, email, token, key);
+              if (issue) results.push(issue);
+            } catch {
+              // skip individual failures
+            }
+          }
+          if (results.length > 0) {
+            return {
+              issues: this.normalizeIssues(siteUrl, results),
+              total: keys.length,
+              startAt: 0,
+              maxResults: limit,
+              nextPageToken: undefined,
+            };
           }
         }
-        if (results.length > 0) return this.normalizeIssues(siteUrl, results);
+      } catch {
+        // ignore
       }
-    } catch {
-      // ignore
     }
-    return [];
+    return { issues: [], total: 0, startAt: 0, maxResults: limit, nextPageToken: undefined };
   }
 
   async searchIssues(searchTerm: string, limit = 20): Promise<any[]> {
@@ -152,8 +221,8 @@ export default class JiraService {
     const sanitized = term.replace(/\"/g, '\\\"');
     const inner = `text ~ \"${sanitized}\" OR key = ${term}`;
     const jql = inner;
-    const data = await this.searchRaw(siteUrl, email, token, jql, limit);
-    return this.normalizeIssues(siteUrl, data);
+    const result = await this.searchRaw(siteUrl, email, token, jql, limit);
+    return this.normalizeIssues(siteUrl, result.issues);
   }
 
   private async requireAuth(): Promise<{ siteUrl: string; email: string; token: string }> {
@@ -180,19 +249,44 @@ export default class JiraService {
     email: string,
     token: string,
     jql: string,
-    limit: number
+    limit: number,
+    nextPageToken?: string
   ) {
-    const url = new URL('/rest/api/3/search', siteUrl);
-    const payload = JSON.stringify({
-      jql,
-      maxResults: Math.min(Math.max(limit, 1), 100),
-      fields: ['summary', 'updated', 'project', 'status', 'assignee'],
-    });
-    const body = await this.doRequest(url, email, token, 'POST', payload, {
-      'Content-Type': 'application/json',
-    });
+    // Use /rest/api/3/search/jql with nextPageToken pagination
+    const url = new URL('/rest/api/3/search/jql', siteUrl);
+    url.searchParams.set('jql', jql);
+    url.searchParams.set('maxResults', String(Math.min(Math.max(limit, 1), 100)));
+    url.searchParams.set('fields', 'summary,updated,project,status,assignee');
+
+    // Add nextPageToken if provided (for subsequent pages)
+    if (nextPageToken) {
+      url.searchParams.set('nextPageToken', nextPageToken);
+    }
+
+    console.log('[JiraService] Search with nextPageToken:', { jql, limit, hasToken: !!nextPageToken });
+
+    const body = await this.doGet(url, email, token);
     const data = JSON.parse(body || '{}');
-    return Array.isArray(data?.issues) ? data.issues : [];
+
+    const issues = Array.isArray(data?.issues) ? data.issues : [];
+    const issueKeys = issues.map((i: any) => i?.key).filter(Boolean);
+    const responseNextPageToken = data?.nextPageToken;
+
+    console.log('[JiraService] Search response:', {
+      issuesCount: issues.length,
+      total: data?.total,
+      hasNextPage: !!responseNextPageToken,
+      firstIssueKey: issueKeys[0],
+      lastIssueKey: issueKeys[issueKeys.length - 1],
+    });
+
+    return {
+      issues,
+      total: typeof data?.total === 'number' ? data.total : 0,
+      startAt: typeof data?.startAt === 'number' ? data.startAt : 0,
+      maxResults: typeof data?.maxResults === 'number' ? data.maxResults : limit,
+      nextPageToken: responseNextPageToken,
+    };
   }
 
   private async doGet(url: URL, email: string, token: string): Promise<string> {
@@ -244,17 +338,42 @@ export default class JiraService {
   }
 
   // Enhanced search that supports direct issue-key lookups and robust quoting
-  async smartSearchIssues(searchTerm: string, limit = 20): Promise<any[]> {
+  async smartSearchIssues(
+    searchTerm: string,
+    limit = 20,
+    options?: { hideResolved?: boolean; projectKey?: string; nextPageToken?: string }
+  ): Promise<{ issues: any[]; total: number; startAt: number; maxResults: number; nextPageToken?: string }> {
     const term = (searchTerm || '').trim();
-    if (!term) return [];
+    if (!term) return { issues: [], total: 0, startAt: 0, maxResults: limit, nextPageToken: undefined };
     const { siteUrl, email, token } = await this.requireAuth();
+    const nextPageToken = options?.nextPageToken;
 
     const looksLikeKey = /^[A-Za-z][A-Za-z0-9_]*-\d+$/.test(term);
-    if (looksLikeKey) {
+    if (looksLikeKey && !nextPageToken) {
       const keyUpper = term.toUpperCase();
       try {
         const issue = await this.getIssueByKey(siteUrl, email, token, keyUpper);
-        if (issue) return this.normalizeIssues(siteUrl, [issue]);
+        // Check if issue matches filters
+        if (issue) {
+          // Apply filters manually for direct key lookup
+          if (options?.hideResolved) {
+            const resolvedStatuses = ['done', 'resolved', 'closed'];
+            const status = (issue.fields?.status?.name || '').toLowerCase();
+            if (resolvedStatuses.includes(status)) {
+              // Issue is resolved, skip it
+              return { issues: [], total: 0, startAt: 0, maxResults: limit, nextPageToken: undefined };
+            }
+          }
+          if (options?.projectKey) {
+            const projectKey = issue.fields?.project?.key;
+            if (projectKey !== options.projectKey) {
+              // Issue doesn't match project filter
+              return { issues: [], total: 0, startAt: 0, maxResults: limit, nextPageToken: undefined };
+            }
+          }
+          const normalized = this.normalizeIssues(siteUrl, [issue]);
+          return { issues: normalized, total: 1, startAt: 0, maxResults: limit, nextPageToken: undefined };
+        }
       } catch {
         // If direct fetch fails (404/403/etc.), falling back to JQL search below
       }
@@ -262,11 +381,44 @@ export default class JiraService {
 
     // Build JQL safely (escape quotes in term)
     const sanitized = term.replace(/"/g, '\\"');
-    const extraKey = looksLikeKey ? ` OR issueKey = ${term.toUpperCase()}` : '';
-    const inner = `text ~ \"${sanitized}\"${extraKey}`;
-    const jql = inner;
-    const data = await this.searchRaw(siteUrl, email, token, jql, limit);
-    return this.normalizeIssues(siteUrl, data);
+
+    // Use explicit field search instead of text~ which requires indexing
+    // Only search in summary and issueKey for performance (description can be very long)
+    // Add wildcard (*) for prefix matching unless term already has wildcards
+    const wildcardTerm = sanitized.includes('*') ? sanitized : `${sanitized}*`;
+    const summaryMatch = `summary ~ \"${wildcardTerm}\"`;
+    const keyMatch = looksLikeKey ? `issueKey = \"${term.toUpperCase()}\"` : `issueKey ~ \"${wildcardTerm}\"`;
+
+    const searchClause = `(${summaryMatch} OR ${keyMatch})`;
+
+    // Build filter clauses
+    const filters: string[] = [searchClause];
+    if (options?.hideResolved) {
+      filters.push('status NOT IN (Done, Resolved, Closed)');
+    }
+    if (options?.projectKey) {
+      filters.push(`project = "${options.projectKey}"`);
+    }
+
+    const jql = filters.join(' AND ');
+
+    console.log('[JiraService] Search term:', term, '-> with wildcard:', wildcardTerm);
+    console.log('[JiraService] Generated JQL:', jql);
+
+    try {
+      const result = await this.searchRaw(siteUrl, email, token, jql, limit, nextPageToken);
+      console.log('[JiraService] Search results count:', result.issues?.length || 0);
+      return {
+        issues: this.normalizeIssues(siteUrl, result.issues),
+        total: result.total,
+        startAt: result.startAt,
+        maxResults: result.maxResults,
+        nextPageToken: result.nextPageToken,
+      };
+    } catch (error) {
+      console.error('[JiraService] Search error:', error);
+      throw error;
+    }
   }
 
   private async getIssueByKey(
