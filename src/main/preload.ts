@@ -319,9 +319,15 @@ contextBridge.exposeInMainWorld('electronAPI', {
     ipcRenderer.invoke('jira:saveCredentials', args),
   jiraClearCredentials: () => ipcRenderer.invoke('jira:clearCredentials'),
   jiraCheckConnection: () => ipcRenderer.invoke('jira:checkConnection'),
-  jiraInitialFetch: (limit?: number) => ipcRenderer.invoke('jira:initialFetch', limit),
-  jiraSearchIssues: (searchTerm: string, limit?: number) =>
-    ipcRenderer.invoke('jira:searchIssues', searchTerm, limit),
+  jiraInitialFetch: (
+    limit?: number,
+    options?: { hideResolved?: boolean; projectKey?: string; nextPageToken?: string }
+  ) => ipcRenderer.invoke('jira:initialFetch', limit, options),
+  jiraSearchIssues: (
+    searchTerm: string,
+    limit?: number,
+    options?: { hideResolved?: boolean; projectKey?: string; nextPageToken?: string }
+  ) => ipcRenderer.invoke('jira:searchIssues', searchTerm, limit, options),
   getProviderStatuses: (opts?: { refresh?: boolean; providers?: string[]; providerId?: string }) =>
     ipcRenderer.invoke('providers:getStatuses', opts ?? {}),
   // Database methods

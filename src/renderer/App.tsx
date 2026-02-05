@@ -22,6 +22,7 @@ import RightSidebar from './components/RightSidebar';
 import CodeEditor from './components/FileExplorer/CodeEditor';
 import SettingsModal from './components/SettingsModal';
 import TaskModal from './components/TaskModal';
+import JiraBulkImportModal from './components/JiraBulkImportModal';
 import { pickDefaultBranch } from './components/BranchSelect';
 import { ThemeProvider } from './components/ThemeProvider';
 import Titlebar from './components/titlebar/Titlebar';
@@ -46,7 +47,7 @@ import {
 } from './lib/projectUtils';
 import { BrowserProvider } from './providers/BrowserProvider';
 import { terminalSessionRegistry } from './terminal/SessionRegistry';
-import { type Agent } from './types';
+import { type Agent, type ProviderId } from './types';
 import type { Project, Task } from './types/app';
 import type { TaskMetadata } from './types/chat';
 import { type GitHubIssueSummary } from './types/github';
@@ -185,6 +186,7 @@ const AppContent: React.FC = () => {
   const [selectedProject, setSelectedProject] = useState<Project | null>(null);
   const [showEditorMode, setShowEditorMode] = useState(false);
   const [showTaskModal, setShowTaskModal] = useState<boolean>(false);
+  const [showBulkImportModal, setShowBulkImportModal] = useState<boolean>(false);
   // Branch options (loaded when project is selected)
   const [projectBranchOptions, setProjectBranchOptions] = useState<
     Array<{ value: string; label: string }>
@@ -1777,6 +1779,124 @@ const AppContent: React.FC = () => {
     }
   };
 
+  const handleBulkImportJira = useCallback(
+    async (
+      selectedIssues: JiraIssueSummary[],
+      settings: {
+        agent: ProviderId | null;
+        branchPrefix: string;
+        autoApprove: boolean;
+        autoStart: boolean;
+        useWorktree: boolean;
+      },
+      onProgress?: (results: Array<{
+        issueKey: string;
+        issueSummary: string;
+        status: 'pending' | 'creating' | 'success' | 'error';
+        taskId?: string;
+        taskName?: string;
+        error?: string;
+      }>) => void
+    ): Promise<Array<{
+      issueKey: string;
+      issueSummary: string;
+      status: 'pending' | 'creating' | 'success' | 'error';
+      taskId?: string;
+      taskName?: string;
+      error?: string;
+    }>> => {
+      if (!selectedProject || !settings.agent) return [];
+
+      type TaskResult = {
+        issueKey: string;
+        issueSummary: string;
+        status: 'pending' | 'creating' | 'success' | 'error';
+        taskId?: string;
+        taskName?: string;
+        error?: string;
+      };
+
+      const results: TaskResult[] = selectedIssues.map((issue) => ({
+        issueKey: issue.key,
+        issueSummary: issue.summary,
+        status: 'pending' as const,
+      }));
+
+      // Helper: Generate task name from JIRA issue
+      const generateTaskName = (issue: JiraIssueSummary): string => {
+        const slugifiedSummary = issue.summary
+          .toLowerCase()
+          .replace(/[^a-z0-9]+/g, '-')
+          .replace(/^-|-$/g, '')
+          .slice(0, 50);
+
+        const baseName = `${issue.key.toLowerCase()}-${slugifiedSummary}`;
+        return settings.branchPrefix
+          ? `${settings.branchPrefix}${baseName}`
+          : baseName;
+      };
+
+      // Helper: Create single task
+      const createTaskForIssue = async (
+        issue: JiraIssueSummary,
+        index: number
+      ): Promise<TaskResult> => {
+        try {
+          results[index] = { ...results[index], status: 'creating' };
+          onProgress?.([...results]);
+
+          const taskName = generateTaskName(issue);
+          results[index] = { ...results[index], taskName };
+
+          // Reuse existing handleCreateTask
+          await handleCreateTask(
+            taskName,
+            undefined, // initialPrompt (enriched later)
+            [{ agent: settings.agent!, runs: 1 }],
+            null, // linearIssue
+            null, // githubIssue
+            issue, // jiraIssue
+            settings.autoApprove,
+            settings.useWorktree,
+            selectedProject.gitInfo?.branch || 'main'
+          );
+
+          return {
+            ...results[index],
+            status: 'success',
+            taskId: taskName,
+          };
+        } catch (error) {
+          return {
+            ...results[index],
+            status: 'error',
+            error: error instanceof Error ? error.message : String(error),
+          };
+        }
+      };
+
+      // Create tasks in parallel batches of 5
+      for (let i = 0; i < selectedIssues.length; i += 5) {
+        const batch = selectedIssues.slice(i, i + 5);
+        const batchResults = await Promise.allSettled(
+          batch.map((issue, idx) => createTaskForIssue(issue, i + idx))
+        );
+
+        // Update results array
+        batchResults.forEach((result, idx) => {
+          if (result.status === 'fulfilled') {
+            results[i + idx] = result.value;
+          }
+        });
+
+        onProgress?.([...results]);
+      }
+
+      return results;
+    },
+    [selectedProject, handleCreateTask]
+  );
+
   const handleGoHome = () => {
     setSelectedProject(null);
     setShowHomeView(true);
@@ -1801,6 +1921,15 @@ const AppContent: React.FC = () => {
       const targetProject = projects.find((p) => p.id === project.id) || project;
       activateProjectView(targetProject);
       setShowTaskModal(true);
+    },
+    [activateProjectView, projects]
+  );
+
+  const handleOpenBulkImport = useCallback(
+    (project: Project) => {
+      const targetProject = projects.find((p) => p.id === project.id) || project;
+      activateProjectView(targetProject);
+      setShowBulkImportModal(true);
     },
     [activateProjectView, projects]
   );
@@ -2769,6 +2898,7 @@ const AppContent: React.FC = () => {
                       onReorderProjectsFull={handleReorderProjectsFull}
                       onSidebarContextChange={handleSidebarContextChange}
                       onCreateTaskForProject={handleStartCreateTaskFromSidebar}
+                      onBulkImportJira={handleOpenBulkImport}
                       onDeleteTask={handleDeleteTask}
                       onRenameTask={handleRenameTask}
                       onArchiveTask={handleArchiveTask}
@@ -2846,6 +2976,14 @@ const AppContent: React.FC = () => {
                 branchOptions={projectBranchOptions}
                 isLoadingBranches={isLoadingBranches}
               />
+              {showBulkImportModal && selectedProject && (
+                <JiraBulkImportModal
+                  isOpen={showBulkImportModal}
+                  onClose={() => setShowBulkImportModal(false)}
+                  onImport={handleBulkImportJira}
+                  project={selectedProject}
+                />
+              )}
               <NewProjectModal
                 isOpen={showNewProjectModal}
                 onClose={() => setShowNewProjectModal(false)}

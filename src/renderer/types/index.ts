@@ -1,5 +1,7 @@
 import type { ProviderId } from '@shared/providers/registry';
 
+export type { ProviderId };
+
 export interface Repo {
   id: string;
   path: string;
